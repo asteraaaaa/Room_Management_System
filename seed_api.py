@@ -100,7 +100,7 @@ def get(path):
 # -------------------------------
 # Main Seeder
 # -------------------------------
-def main():
+def main(force=False):
     print("🔹 Checking rooms...")
     created = []
     for room in ROOMS:
@@ -119,6 +119,14 @@ def main():
         return
     name_to_id = {r["name"]: r["id"] for r in rooms}
     print(f"Total rooms available: {len(name_to_id)}")
+
+    # Rooms are skipped when they already exist, but every run used to add another ~60 bookings.
+    # Only seed bookings into an empty database unless --force is given.
+    ok, existing = get("/bookings/")
+    if ok and existing and not force:
+        print(f"ℹ️  {len(existing)} booking(s) already exist; not adding more. Use --force to add another batch.")
+        print("Done seeding!")
+        return
 
     # Create 60 random bookings across next 14 days
     print("🔹 Creating bookings...")
@@ -158,4 +166,5 @@ def main():
     print("Done seeding!")
 
 if __name__ == "__main__":
-    main()
+    import sys
+    main(force="--force" in sys.argv[1:])
