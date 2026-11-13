@@ -81,6 +81,43 @@ def toast_result(ok: bool, msg_ok: str, msg_err: str):
     else:
         st.error(msg_err)
 
+def flash(kind: str, message: str):
+    """
+    Queue a message for the next run. A message shown right before st.rerun() is erased
+    immediately, so it has to be shown on the run after the rerun instead.
+    """
+    st.session_state["_flash"] = (kind, message)
+
+def show_flash():
+    # The container is always created, even when there is no message. If the banner only existed on some
+    # runs, the page layout would shift between runs and Streamlit would reset the tabs to the first one,
+    # hiding whatever the user was just working on (for example the delete confirmation).
+    slot = st.container()
+    item = st.session_state.pop("_flash", None)
+    if item:
+        kind, message = item
+        with slot:
+            (st.success if kind == "success" else st.error)(message)
+
+def error_text(data, fallback: str) -> str:
+    """The API's own errors have a text 'detail'; validation errors send a list of problems."""
+    detail = data.get("detail") if isinstance(data, dict) else None
+    if isinstance(detail, list):
+        parts = []
+        for item in detail:
+            where = ".".join(str(x) for x in item.get("loc", []) if x != "body")
+            msg = item.get("msg", "invalid value")
+            parts.append(f"{where}: {msg}" if where else msg)
+        return "; ".join(parts) or fallback
+    return str(detail) if detail else fallback
+
+def form_key(prefix: str) -> str:
+    """A form whose key changes starts empty again (used to clear a form after it succeeds)."""
+    return f"{prefix}_{st.session_state.get(prefix + '_v', 0)}"
+
+def reset_form(prefix: str):
+    st.session_state[prefix + "_v"] = st.session_state.get(prefix + "_v", 0) + 1
+
 # Keep equipment presets to aid UX; can still type custom below
 EQUIPMENT_PRESETS = [
     "Projector", "Whiteboard", "HDMI", "TV", "Conference Phone", "Speaker",
@@ -98,7 +135,7 @@ def rooms_page():
     # --- Create Room ---
     with t1:
         st.subheader("Create New Room")
-        with st.form("create_room_form"):
+        with st.form(form_key("create_room_form")):
             name = st.text_input("Name", placeholder="Briefing Room A", help="Required")
             col1, col2 = st.columns(2)
             with col1:
@@ -128,10 +165,11 @@ def rooms_page():
                     }
                     data, code = post("/rooms/", payload)
                     if code == 201:
-                        st.success(f"✅ Room created: {data['name']} (ID saved by server)")
+                        flash("success", f"✅ Room created: {data['name']}")
+                        reset_form("create_room_form")   # empty form for the next room
                         st.rerun()
                     else:
-                        st.error(f"❌ {data.get('detail', 'Failed to create room')}")
+                        st.error(f"❌ {error_text(data, 'Failed to create room')}")
 
     # --- View/Manage Rooms ---
     with t2:
@@ -154,13 +192,27 @@ def rooms_page():
                 label_id_map = {f"{r['name']} ({r['id'][:8]}…)": r["id"] for r in rooms}
                 pick = st.selectbox("Select room to delete", list(label_id_map.keys()) if label_id_map else [], key="del_room_pick")
                 if pick and st.button("Delete Room", type="secondary"):
-                    rid = label_id_map[pick]
-                    d, c = delete(f"/rooms/{rid}")
-                    if c == 200:
-                        st.success("🗑️ Room deleted (and its bookings).")
+                    # Deleting a room also deletes its bookings, so ask first instead of doing it on one click.
+                    st.session_state["confirm_delete_room"] = (label_id_map[pick], pick)
+
+                pending = st.session_state.get("confirm_delete_room")
+                if pending:
+                    rid, label = pending
+                    bk, bc = get(f"/rooms/{rid}/bookings")
+                    n = len(bk) if bc == 200 and isinstance(bk, list) else 0
+                    st.warning(f"Delete **{label}** and its **{n}** booking(s)? This cannot be undone.")
+                    yes_col, no_col = st.columns(2)
+                    if yes_col.button("Yes, delete it", type="primary", key="confirm_delete_yes"):
+                        d, c = delete(f"/rooms/{rid}")
+                        st.session_state.pop("confirm_delete_room", None)
+                        if c == 200:
+                            flash("success", f"🗑️ Deleted {label} and its {n} booking(s).")
+                        else:
+                            flash("error", f"❌ {error_text(d, 'Delete failed')}")
                         st.rerun()
-                    else:
-                        st.error(f"❌ {d.get('detail','Delete failed')}")
+                    if no_col.button("Keep it", key="confirm_delete_no"):
+                        st.session_state.pop("confirm_delete_room", None)
+                        st.rerun()
             with colB:
                 st.info("Tip: Delete cascades all bookings for that room.")
 
@@ -205,10 +257,10 @@ def rooms_page():
                         }
                         data, code = patch(f"/rooms/{r['id']}", payload)
                         if code == 200:
-                            st.success("✅ Room updated")
+                            flash("success", "✅ Room updated")
                             st.rerun()
                         else:
-                            st.error(f"❌ {data.get('detail', 'Update failed')}")
+                            st.error(f"❌ {error_text(data, 'Update failed')}")
         else:
             st.info("No rooms to edit")
 
@@ -228,7 +280,7 @@ def bookings_page():
         if not active_rooms:
             st.warning("⚠️ No rooms available. Create a room first.")
         else:
-            with st.form("create_booking_form"):
+            with st.form(form_key("create_booking_form")):
                 rmap = {f"{r['name']} ({r.get('level','-')})": r for r in active_rooms if r.get("active", True)}
                 room_label = st.selectbox("Room", list(rmap.keys()))
                 col1, col2, col3 = st.columns([1.2, 1, 1])
@@ -267,10 +319,11 @@ def bookings_page():
                         }
                         data, code = post("/bookings/", payload)
                         if code == 201:
-                            st.success("✅ Booking created")
+                            flash("success", f"✅ Booking created: {data['room_name']}, {to_human_dt(data['start'])} → {to_human_dt(data['end'])}")
+                            reset_form("create_booking_form")   # empty form for the next booking
                             st.rerun()
                         else:
-                            st.error(f"❌ {data.get('detail','Failed to create booking')}")
+                            st.error(f"❌ {error_text(data, 'Failed to create booking')}")
 
     # --- All Bookings ---
     with t2:
@@ -295,10 +348,10 @@ def bookings_page():
                 bid = label_id_map[pick]
                 d, c = delete(f"/bookings/{bid}")
                 if c == 200:
-                    st.success("🗑️ Booking cancelled")
+                    flash("success", "🗑️ Booking cancelled")
                     st.rerun()
                 else:
-                    st.error(f"❌ {d.get('detail','Delete failed')}")
+                    st.error(f"❌ {error_text(d, 'Delete failed')}")
         else:
             st.info("No bookings yet")
 
@@ -360,6 +413,7 @@ if not api_ok():
     st.info("Run API first:\n\n```bash\npython fastapi_rooms.py\n```")
 else:
     st.success("Connected to FastAPI server")
+    show_flash()   # result of the last create / update / delete, shown after the page reloads
     st.sidebar.title("Navigation")
     page = st.sidebar.selectbox("Choose a page", ["Rooms", "Bookings", "Dashboard"])
     if page == "Rooms":
